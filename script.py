@@ -10,28 +10,34 @@ import math
 # =====================================================================
 #  EINSTELLUNGEN
 # =====================================================================
-DROHNE_IP = "192.168.8.184"
+DROHNE_IP = "10.0.11.109"
 PORT = 8889
 
-FLIEGEN = True        # False = nur testen (Drohne bleibt am Boden), True = fliegen
+FLIEGEN = True       # False = nur testen (Drohne bleibt am Boden), True = fliegen
 
-SCHWELLE = 20          # Grauwert: alles darunter gilt als Linie (im Fenster "Maske" live einstellbar)
+ABSTAND = 40           # so viel dunkler als der Boden muss die Linie sein (im Fenster "Maske" live einstellbar)
 MIN_PIXEL = 60        # so viele dunkle Pixel braucht ein Streifen (live einstellbar)
 
-SPEED_VOR = 10          # Vorwaertsgeschwindigkeit (klein anfangen)
+SPEED_VOR = 20          # Vorwaertsgeschwindigkeit (unter ca. 15 bewegt sich die Tello kaum)
 DREHUNG = cv2.ROTATE_90_COUNTERCLOCKWISE
+SPIEGELN = False       # True, falls links/rechts im Bild vertauscht ist (vorher mit FLIEGEN = False testen!)
+KAMERA_HOEHE = 240     # Bodenkamera = 320x240. Die Tello schickt ein 320x720-Bild, nur die oberen 240 Zeilen sind echt.
 RUNTER_NACH_START = 30
 KP_SEITE = 0.20        # wie stark seitlich korrigiert wird
 KD_SEITE = 0.15        # bremst das Pendeln
-KP_DREH = 1         # wie stark in Kurven gedreht wird
+KP_DREH = 0.8          # wie stark in Kurven gedreht wird (pro Grad Abweichung)
 MAX_SEITE = 20         # maximale seitliche Geschwindigkeit
-MAX_DREH = 30          # maximale Drehgeschwindigkeit
-GLAETTUNG = 0.6        # 0 = keine Glaettung, 0.9 = sehr traege
+MAX_DREH = 50          # maximale Drehgeschwindigkeit
+GLAETTUNG = 0.4        # 0 = keine Glaettung, 0.9 = sehr traege
+KURVE_BREMSEN = 0.8    # 0 = in Kurven nicht bremsen, 1 = bei 60 Grad ganz anhalten
+SUCH_DREH = 25         # Drehgeschwindigkeit, wenn die Linie kurz weg ist
 
-VERLOREN_SEK = 1     # so lange darf die Linie fehlen, dann Landung
+VERLOREN_SEK = 3     # so lange darf die Linie fehlen, dann Landung
 MAX_FLUGZEIT = 120     # nach so vielen Sekunden Landung (nur beim Fliegen)
 AKKU_MIN_START = 20    # unter diesem Akkustand (%) kein Start
 AKKU_MIN_FLUG = 15     # unter diesem Akkustand (%) Landung
+
+ROHBILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kamerabild_roh.png")
 
 # =====================================================================
 #  VERBINDUNG
@@ -100,6 +106,7 @@ def ping():
 # =====================================================================
 class BildLeser:
     def __init__(self, url):
+        self.url = url
         self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
         self.bild = None
         self.nummer = 0
@@ -109,12 +116,20 @@ class BildLeser:
         self.thread.start()
 
     def _lesen(self):
+        letztes_ok = time.time()
         while self.laeuft:
             ok, b = self.cap.read()
             if ok:
+                letztes_ok = time.time()
                 with self.lock:
                     self.bild = b
                     self.nummer += 1
+            elif time.time() - letztes_ok > 3:
+                # Stream haengt: neu verbinden
+                print("Video haengt, verbinde neu...")
+                self.cap.release()
+                self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                letztes_ok = time.time()
             else:
                 time.sleep(0.01)
 
@@ -122,10 +137,15 @@ class BildLeser:
         with self.lock:
             if self.bild is None:
                 return self.nummer, None
-            b = self.bild.copy()
-            if DREHUNG is not None:
-                b = cv2.rotate(b, DREHUNG)
-            return self.nummer, b
+            nummer, b = self.nummer, self.bild.copy()
+        # nur der echte Teil des Bodenkamera-Bilds, der Rest ist Muell und verschiebt die Bildmitte
+        if b.shape[0] > KAMERA_HOEHE:
+            b = b[:KAMERA_HOEHE]
+        if DREHUNG is not None:
+            b = cv2.rotate(b, DREHUNG)
+        if SPIEGELN:
+            b = cv2.flip(b, 1)
+        return nummer, b
 
     def stop(self):
         self.laeuft = False
@@ -140,12 +160,26 @@ def begrenze(wert, grenze):
     return int(max(-grenze, min(grenze, wert)))
 
 
-def schwerpunkt_x(maske, y0, y1, min_pixel):
+def linien_maske(grau, abstand):
+    # Schwelle relativ zur Bodenhelligkeit, damit Licht und Bodenfarbe egal sind
+    boden = float(cv2.medianBlur(grau, 5).mean())
+    _, maske = cv2.threshold(grau, max(boden - abstand, 0), 255, cv2.THRESH_BINARY_INV)
+    maske = cv2.morphologyEx(maske, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    # nur den groessten dunklen Fleck behalten, Schatten und Rauschen fliegen raus
+    anzahl, beschriftung, werte, _ = cv2.connectedComponentsWithStats(maske)
+    if anzahl <= 1:
+        return maske, boden
+    groesster = 1 + int(werte[1:, cv2.CC_STAT_AREA].argmax())
+    return ((beschriftung == groesster) * 255).astype("uint8"), boden
+
+
+def schwerpunkt(maske, y0, y1, min_pixel):
+    # Mittelpunkt (x, y) der Linie im Streifen y0..y1, oder None
     streifen = maske[y0:y1, :]
     m = cv2.moments(streifen, binaryImage=True)
     if m["m00"] == 0 or m["m00"] < min_pixel:
         return None
-    return m["m10"] / m["m00"]
+    return m["m10"] / m["m00"], y0 + m["m01"] / m["m00"]
 
 
 # =====================================================================
@@ -153,7 +187,7 @@ def schwerpunkt_x(maske, y0, y1, min_pixel):
 # =====================================================================
 leser = None
 grund = "unbekannt"
-s_aktuell = SCHWELLE
+s_aktuell = ABSTAND
 mp_aktuell = MIN_PIXEL
 
 try:
@@ -165,6 +199,8 @@ try:
     if FLIEGEN and (stand is None or stand < AKKU_MIN_START):
         raise SystemExit("Akku zu schwach oder keine Antwort, kein Flug.")
 
+    sende("streamoff")                      # haengenden Stream vom letzten Lauf beenden
+    time.sleep(0.5)
     sende("downvision 1")
     sende("streamon")
 
@@ -180,15 +216,26 @@ try:
         ping()
         time.sleep(0.05)
     print("Bild kommt an.")
+    # die ersten Bilder sind oft noch fehlerhaft, deshalb kurz warten
+    start = time.time()
+    while time.time() - start < 2:
+        nummer, bild = leser.hole()
+        ping()
+        time.sleep(0.05)
 
+    cv2.imwrite(ROHBILD, bild)
+    print("Rohbild gespeichert:", ROHBILD)
     h, w = bild.shape[:2]
-    mitte_x = w / 2
-    nah = (int(h * 0.80), int(h * 0.98))    # Streifen direkt unter der Drohne
-    fern = (int(h * 0.02), int(h * 0.20))   # Streifen weiter vorne (oben im Bild)
+    print(f"Kamerabild: {w}x{h} (erwartet 240x320)")
+    if FLIEGEN and (w, h) != (240, 320):
+        raise SystemExit("Kamerabild hat nicht die erwartete Groesse, bitte erst mit FLIEGEN = False pruefen.")
+    mitte_x, mitte_y = w / 2, h / 2         # die Kamera sitzt unter der Bildmitte
+    mitte = (int(h * 0.35), int(h * 0.65))  # Streifen auf Hoehe der Drohne -> seitliche Abweichung
+    vorne = (0, int(h * 0.35))              # Streifen vor der Drohne -> Zielpunkt fuer die Richtung
 
     # Regler fuer Schwelle und Mindestpixel im Fenster "Maske"
     cv2.namedWindow("Maske")
-    cv2.createTrackbar("Schwelle", "Maske", SCHWELLE, 255, lambda v: None)
+    cv2.createTrackbar("Abstand", "Maske", ABSTAND, 255, lambda v: None)
     cv2.createTrackbar("MinPixel", "Maske", MIN_PIXEL, 1000, lambda v: None)
 
     if FLIEGEN:
@@ -207,10 +254,15 @@ try:
     letzte_nummer = nummer
     letzter_fehler = 0.0
     fehler_glatt = 0.0
+    yaw_glatt = 0.0
+    letzte_seite = 1                        # in welche Richtung die Linie zuletzt abgebogen ist
     akku_text = stand
 
     while True:
         taste = cv2.waitKey(1) & 0xFF
+        if taste == ord("s"):
+            cv2.imwrite(ROHBILD, leser.hole()[1])
+            print("Rohbild gespeichert:", ROHBILD)
         if taste in (27, ord("q")):
             grund = "ESC oder q gedrueckt"
             break
@@ -220,7 +272,7 @@ try:
 
         nummer, bild = leser.hole()
         if bild is None or nummer == letzte_nummer:
-            if time.time() - letztes_neues_bild > 5:
+            if time.time() - letztes_neues_bild > 10:
                 grund = "Kein Bild mehr"
                 break
             if FLIEGEN and time.time() - letztes_neues_bild > 0.5:
@@ -246,45 +298,52 @@ try:
                     break
 
         # Linie erkennen
-        s_aktuell = cv2.getTrackbarPos("Schwelle", "Maske")
+        s_aktuell = cv2.getTrackbarPos("Abstand", "Maske")
         mp_aktuell = cv2.getTrackbarPos("MinPixel", "Maske")
         grau = cv2.GaussianBlur(cv2.cvtColor(bild, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-        _, maske = cv2.threshold(grau, s_aktuell, 255, cv2.THRESH_BINARY_INV)
-        maske = cv2.medianBlur(maske, 5)
+        maske, boden = linien_maske(grau, s_aktuell)
 
-        x_nah = schwerpunkt_x(maske, nah[0], nah[1], mp_aktuell)
-        x_fern = schwerpunkt_x(maske, fern[0], fern[1], mp_aktuell)
+        p_mitte = schwerpunkt(maske, mitte[0], mitte[1], mp_aktuell)
+        p_vorne = schwerpunkt(maske, vorne[0], vorne[1], mp_aktuell)
 
         lr, yaw, vor = 0, 0, 0
-        if x_nah is not None or x_fern is not None:
+        if p_mitte is not None or p_vorne is not None:
             status = "Linie"
             zuletzt_gesehen = time.time()
-            winkel = 0
-            if x_nah is not None and x_fern is not None:
-                referenz = (x_nah + x_fern) / 2     # Linie auf Höhe der Drohne
-                y_nah = (nah[0] + nah[1]) / 2
-                y_fern = (fern[0] + fern[1]) / 2
-                winkel = math.degrees(math.atan2(x_fern - x_nah, y_nah - y_fern))
-                yaw = begrenze(winkel * KP_DREH, MAX_DREH)
-            else:
-                referenz = x_nah if x_nah is not None else x_fern
+            # Richtung: von der Drohne (Bildmitte) zum Zielpunkt vorne.
+            # Faellt die Linie in einer Kurve seitlich aus dem Bild, liegt der Zielpunkt
+            # weit aussen und die Drohne dreht kraeftig.
+            ziel = p_vorne if p_vorne is not None else p_mitte
+            winkel = math.degrees(math.atan2(ziel[0] - mitte_x, max(mitte_y - ziel[1], 1)))
+            yaw_glatt = GLAETTUNG * yaw_glatt + (1 - GLAETTUNG) * winkel * KP_DREH
+            yaw = begrenze(yaw_glatt, MAX_DREH)
+            if abs(winkel) > 10:
+                letzte_seite = 1 if winkel > 0 else -1
+
+            # seitlich: Linie unter der Drohne halten
+            referenz = p_mitte[0] if p_mitte is not None else ziel[0]
             fehler = referenz - mitte_x
             fehler_glatt = GLAETTUNG * fehler_glatt + (1 - GLAETTUNG) * fehler
             lr = begrenze(fehler_glatt * KP_SEITE + (fehler_glatt - letzter_fehler) * KD_SEITE, MAX_SEITE)
             letzter_fehler = fehler_glatt
-            # in Kurven und bei großer Abweichung langsamer fliegen
-            abweichung = max(min(abs(fehler) / (w / 2), 1), min(abs(winkel) / 45, 1))
-            vor = int(SPEED_VOR * (1 - 0.6 * abweichung))
+
+            # in Kurven langsamer, damit die Drehung hinterherkommt
+            vor = int(SPEED_VOR * (1 - KURVE_BREMSEN * min(abs(winkel) / 60, 1)))
+            if p_vorne is None:
+                vor = vor // 2                  # vorne nichts zu sehen (Kurve/Ende): vorsichtig
         else:
             fehler_glatt = letzter_fehler = 0.0     # alter Zustand wuerde beim Wiederfinden einen D-Sprung ausloesen
-            x_alle = schwerpunkt_x(maske, 0, h, mp_aktuell)
-            if x_alle is not None:
-                # Linie nur ausserhalb der Streifen: nur seitlich zur Linie hin
-                status = "Linie am Rand"
+            p_alle = schwerpunkt(maske, 0, h, mp_aktuell)
+            if p_alle is not None:
+                # Linie nur hinter der Drohne: dorthin zurueck
+                status = "Linie hinten"
                 zuletzt_gesehen = time.time()
-                lr = begrenze((x_alle - mitte_x) * KP_SEITE, MAX_SEITE)
+                lr = begrenze((p_alle[0] - mitte_x) * KP_SEITE, MAX_SEITE)
+                vor = begrenze((mitte_y - p_alle[1]) * KP_SEITE, MAX_SEITE)
             else:
-                status = "KEINE LINIE"
+                # kurz weg: auf der Stelle in die letzte Kurvenrichtung drehen und suchen
+                status = "SUCHE"
+                yaw = SUCH_DREH * letzte_seite
                 if time.time() - zuletzt_gesehen > VERLOREN_SEK:
                     grund = "Linie verloren"
                     break
@@ -295,17 +354,19 @@ try:
             ping()
 
         if time.time() - letzte_ausgabe > 1:
-            print(f"{status}: nah={x_nah} fern={x_fern} -> seitlich {lr}, vor {vor}, drehen {yaw}")
+            print(f"{status} (Boden {boden:.0f}, Bildmitte x={mitte_x:.0f}): mitte={p_mitte} vorne={p_vorne} -> seitlich {lr}, vor {vor}, drehen {yaw}")
             letzte_ausgabe = time.time()
 
         # Anzeige
-        for (y0, y1), farbe in ((nah, (0, 255, 0)), (fern, (255, 0, 0))):
+        for (y0, y1), farbe in ((mitte, (0, 255, 0)), (vorne, (255, 0, 0))):
             cv2.rectangle(bild, (0, y0), (w - 1, y1), farbe, 1)
-        if x_nah is not None:
-            cv2.circle(bild, (int(x_nah), (nah[0] + nah[1]) // 2), 5, (0, 255, 0), -1)
-        if x_fern is not None:
-            cv2.circle(bild, (int(x_fern), (fern[0] + fern[1]) // 2), 5, (255, 0, 0), -1)
+        for p, farbe in ((p_mitte, (0, 255, 0)), (p_vorne, (255, 0, 0))):
+            if p is not None:
+                cv2.circle(bild, (int(p[0]), int(p[1])), 5, farbe, -1)
         cv2.line(bild, (int(mitte_x), 0), (int(mitte_x), h), (0, 0, 255), 1)
+        # Pfeil: wohin die Drohne gerade fliegen will (oben = vorwaerts, rechts = rechts)
+        cv2.arrowedLine(bild, (w // 2, h // 2), (w // 2 + lr * 3, h // 2 - vor * 3), (0, 0, 255), 2)
+        cv2.putText(bild, f"dreh {yaw:+d}", (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         cv2.putText(bild, f"{status}  Akku {akku_text}%", (4, h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
         cv2.imshow("Kamera", bild)
@@ -313,7 +374,7 @@ try:
 
 finally:
     print("Ende:", grund)
-    print(f"Zuletzt eingestellt: SCHWELLE = {s_aktuell}, MIN_PIXEL = {mp_aktuell}")
+    print(f"Zuletzt eingestellt: ABSTAND = {s_aktuell}, MIN_PIXEL = {mp_aktuell}")
     try:
         rc(0, 0, 0, 0)
         if FLIEGEN:
