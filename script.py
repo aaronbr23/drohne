@@ -143,7 +143,7 @@ def begrenze(wert, grenze):
 def schwerpunkt_x(maske, y0, y1, min_pixel):
     streifen = maske[y0:y1, :]
     m = cv2.moments(streifen, binaryImage=True)
-    if m["m00"] < min_pixel:
+    if m["m00"] == 0 or m["m00"] < min_pixel:
         return None
     return m["m10"] / m["m00"]
 
@@ -235,6 +235,8 @@ try:
         # Akku regelmaessig pruefen
         if time.time() - letzte_akkuabfrage > 15:
             letzte_akkuabfrage = time.time()
+            if FLIEGEN:
+                rc(0, 0, 0, 0)          # akku() blockiert bis 3 s: solange schweben statt blind weiterfliegen
             stand = akku()
             if stand is not None:
                 akku_text = stand
@@ -274,6 +276,7 @@ try:
             abweichung = max(min(abs(fehler) / (w / 2), 1), min(abs(winkel) / 45, 1))
             vor = int(SPEED_VOR * (1 - 0.6 * abweichung))
         else:
+            fehler_glatt = letzter_fehler = 0.0     # alter Zustand wuerde beim Wiederfinden einen D-Sprung ausloesen
             x_alle = schwerpunkt_x(maske, 0, h, mp_aktuell)
             if x_alle is not None:
                 # Linie nur ausserhalb der Streifen: nur seitlich zur Linie hin
